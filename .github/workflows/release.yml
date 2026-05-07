@@ -30,27 +30,47 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
+      safe_sha: ${{ steps.check.outputs.safe_sha }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Determine if release needed
+      - name: Find safe commit (≥3 days old) and determine if release needed
         id: check
         run: |
-          LAST_TAG=$(git tag --sort=-version:refname | head -n1)
           FORCE="${{ inputs.force }}"
-          if [ -z "$LAST_TAG" ]; then
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-          elif [ "$FORCE" = "true" ]; then
+          CUTOFF=$(date -u -d '3 days ago' '+%Y-%m-%dT%H:%M:%SZ')
+
+          # Walk log to find newest commit that is at least 3 days old
+          SAFE_SHA=$(git log --format="%H %cI" -- rust/ | while read sha date; do
+            if [[ "$date" < "$CUTOFF" ]]; then
+              echo "$sha"
+              break
+            fi
+          done)
+
+          if [ -z "$SAFE_SHA" ]; then
+            echo "No commit older than 3 days found — skipping release (supply chain delay)."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "safe_sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "safe_sha=${SAFE_SHA}" >> "$GITHUB_OUTPUT"
+
+          LAST_TAG=$(git tag --sort=-version:refname | head -n1)
+          if [ -z "$LAST_TAG" ] || [ "$FORCE" = "true" ]; then
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           else
-            CHANGES=$(git log "${LAST_TAG}..HEAD" --oneline -- rust/ | wc -l)
-            if [ "$CHANGES" -gt 0 ]; then
-              echo "should_release=true" >> "$GITHUB_OUTPUT"
-            else
+            # Release only if safe commit is newer than the last released commit
+            LAST_TAG_SHA=$(git rev-list -n1 "$LAST_TAG")
+            if git merge-base --is-ancestor "$SAFE_SHA" "$LAST_TAG_SHA" 2>/dev/null; then
+              echo "Safe commit already released — nothing new."
               echo "should_release=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
             fi
           fi
 
@@ -96,6 +116,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.safe_sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -151,6 +173,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -160,9 +184,10 @@ jobs:
       - name: Tag and push
         run: |
           VERSION="${{ needs.check.outputs.version }}"
+          SAFE_SHA="${{ needs.check.outputs.safe_sha }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$VERSION" -m "Release $VERSION (synced from ultraworkers/claw-code)"
+          git tag -a "$VERSION" "$SAFE_SHA" -m "Release $VERSION — built from commit $SAFE_SHA (≥3 days old, synced from ultraworkers/claw-code)"
           git push origin "$VERSION"
 
       - name: Create GitHub Release
@@ -173,7 +198,8 @@ jobs:
           body: |
             Automated release synced from [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code).
 
-            **Versioning:** CalVer `YYYY.MM.DD` — date reflects when upstream changes were pulled.
+            **Versioning:** CalVer `YYYY.MM.DD` — date of release publication.
+            **Supply chain delay:** built from commit `${{ needs.check.outputs.safe_sha }}`, which is ≥3 days old at time of release.
 
             ## Install
 
