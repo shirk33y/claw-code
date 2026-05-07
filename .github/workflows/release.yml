@@ -1,23 +1,74 @@
-name: Release binaries
+name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force release even if no new commits since last tag'
+        required: false
+        default: 'false'
+  workflow_call:
+    inputs:
+      triggered_by_sync:
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  BIN: claw
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine if release needed
+        id: check
+        run: |
+          LAST_TAG=$(git tag --sort=-version:refname | head -n1)
+          FORCE="${{ inputs.force }}"
+          if [ -z "$LAST_TAG" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FORCE" = "true" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            CHANGES=$(git log "${LAST_TAG}..HEAD" --oneline -- rust/ | wc -l)
+            if [ "$CHANGES" -gt 0 ]; then
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Compute CalVer version
+        id: version
+        run: |
+          BASE=$(date -u '+%Y.%m.%d')
+          COUNT=$(git tag --list "${BASE}*" | wc -l | tr -d ' ')
+          if [ "$COUNT" -eq 0 ]; then
+            VERSION="${BASE}"
+          else
+            VERSION="${BASE}.${COUNT}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
     name: build-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -26,43 +77,158 @@ jobs:
         include:
           - name: linux-x64
             os: ubuntu-latest
-            bin: claw
-            artifact_name: claw-linux-x64
+            target: x86_64-unknown-linux-musl
+            artifact: claw-linux-x64
+
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: claw-linux-arm64
+
           - name: macos-arm64
             os: macos-14
-            bin: claw
-            artifact_name: claw-macos-arm64
+            target: aarch64-apple-darwin
+            artifact: claw-macos-arm64
+
     defaults:
       run:
         working-directory: rust
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
+          key: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release -p rusty-claude-cli
+      - name: Install cross-compile toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y musl-tools
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build static binary
+        run: cargo build --release --target ${{ matrix.target }} -p rusty-claude-cli
 
       - name: Package artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact_name }}"
-          chmod +x "dist/${{ matrix.artifact_name }}"
+          cp "target/${{ matrix.target }}/release/${{ env.BIN }}" "dist/${{ matrix.artifact }}"
+          chmod +x "dist/${{ matrix.artifact }}"
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: rust/dist/${{ matrix.artifact_name }}
+          name: ${{ matrix.artifact }}
+          path: |
+            rust/dist/${{ matrix.artifact }}
+            rust/dist/${{ matrix.artifact }}.sha256
 
-      - name: Upload release asset
-        if: startsWith(github.ref, 'refs/tags/')
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Tag and push
+        run: |
+          VERSION="${{ needs.check.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION (synced from ultraworkers/claw-code)"
+          git push origin "$VERSION"
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: rust/dist/${{ matrix.artifact_name }}
+          tag_name: ${{ needs.check.outputs.version }}
+          name: ${{ needs.check.outputs.version }}
+          body: |
+            Automated release synced from [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code).
+
+            **Versioning:** CalVer `YYYY.MM.DD` — date reflects when upstream changes were pulled.
+
+            ## Install
+
+            ```sh
+            brew install shirk33y/tap/claw-code
+            ```
+
+            Or download a binary directly from the assets below.
+          files: dist/*
           fail_on_unmatched_files: true
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${{ needs.check.outputs.version }}"
+          REPO_URL="https://github.com/shirk33y/claw-code/releases/download/${VERSION}"
+
+          X64_SHA=$(awk '{print $1}' dist/claw-linux-x64.sha256)
+          ARM64_LINUX_SHA=$(awk '{print $1}' dist/claw-linux-arm64.sha256)
+          ARM64_MAC_SHA=$(awk '{print $1}' dist/claw-macos-arm64.sha256)
+
+          cat > claw-code.rb << FORMULA
+          class ClawCode < Formula
+            desc "Fast Rust-based Claude CLI (fork of ultraworkers/claw-code)"
+            homepage "https://github.com/shirk33y/claw-code"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${REPO_URL}/claw-macos-arm64"
+                sha256 "${ARM64_MAC_SHA}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${REPO_URL}/claw-linux-arm64"
+                sha256 "${ARM64_LINUX_SHA}"
+              else
+                url "${REPO_URL}/claw-linux-x64"
+                sha256 "${X64_SHA}"
+              end
+            end
+
+            def install
+              bin.install Dir["claw*"].first => "claw"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/claw --version 2>&1", 0)
+            end
+          end
+          FORMULA
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/shirk33y/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp claw-code.rb tap/Formula/claw-code.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/claw-code.rb
+          git diff --cached --quiet || git commit -m "claw-code: update to ${VERSION}"
+          git push

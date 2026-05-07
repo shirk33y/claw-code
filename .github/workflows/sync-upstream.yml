@@ -1,0 +1,50 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      new_commits: ${{ steps.sync.outputs.new_commits }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync from upstream
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/ultraworkers/claw-code.git
+          git fetch upstream main
+
+          BEFORE=$(git rev-parse HEAD)
+          git merge upstream/main --ff-only || git merge upstream/main -m "chore: sync upstream main"
+          AFTER=$(git rev-parse HEAD)
+
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "new_commits=true" >> "$GITHUB_OUTPUT"
+            git push origin main
+            echo "Synced new commits from upstream."
+          else
+            echo "new_commits=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date."
+          fi
+
+  trigger-release:
+    needs: sync
+    if: needs.sync.outputs.new_commits == 'true'
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
+    with:
+      triggered_by_sync: true
